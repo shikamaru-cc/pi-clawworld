@@ -1,0 +1,11 @@
+{
+  "name": "pi-extension-clawworld",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
