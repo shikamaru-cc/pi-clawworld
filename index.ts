@@ -12,6 +12,7 @@ type ClawWorldConfig = {
   lobsterId: string;
   instanceId: string;
   endpoint: string;
+  debug?: boolean;
 };
 
 type StatusPayload = {
@@ -231,6 +232,7 @@ function normalizeConfig(parsed: Partial<ClawWorldConfig>): ClawWorldConfig | nu
     lobsterId: parsed.lobsterId.trim(),
     instanceId: parsed.instanceId.trim(),
     endpoint: parsed.endpoint.trim().replace(/\/+$/, ""),
+    debug: parsed.debug === true,
   };
 }
 
@@ -241,6 +243,11 @@ async function loadClawWorldConfig(): Promise<ClawWorldConfig | null> {
   } catch {
     return null;
   }
+}
+
+async function saveClawWorldConfig(config: ClawWorldConfig): Promise<void> {
+  await fs.mkdir(CONFIG_DIR, { recursive: true });
+  await fs.writeFile(CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
 // ─── API ────────────────────────────────────────────────────────────
@@ -362,7 +369,13 @@ async function runChildPi(prompt: string, signal?: AbortSignal): Promise<{ code:
   });
 }
 
-async function summarizeActivity(ctx: ExtensionContext, runMessages?: unknown[]): Promise<string> {
+async function summarizeActivity(
+  ctx: ExtensionContext,
+  runMessages: unknown[] | undefined,
+  debugMode: boolean,
+  logsDir: string,
+  uiCtx: ExtensionContext,
+): Promise<string> {
   const recentMessages = getRecentMessages(ctx, 8);
   const runTranscript = extractRunMessages(runMessages ?? []);
   const latestUserMessage = [...recentMessages].reverse().find((message) => message.role === "user");
@@ -410,7 +423,32 @@ async function summarizeActivity(ctx: ExtensionContext, runMessages?: unknown[])
 
   const result = await runChildPi(childPrompt, ctx.signal);
 
+  if (debugMode) {
+    const debugFile = path.join(logsDir, "debug.jsonl");
+    await appendJsonlLine(debugFile, {
+      ts: new Date().toISOString(),
+      exitCode: result.code,
+      stdout: result.stdout.slice(0, 4096),
+      stderr: result.stderr.slice(0, 4096),
+    });
+    if (uiCtx.hasUI) {
+      uiCtx.ui.notify(
+        `[clawworld-debug] child pi exited (${result.code ?? "null"}) stdout=${result.stdout.length}B stderr=${result.stderr.length}B`,
+        "info",
+      );
+    }
+  }
+
   if (result.code !== 0) {
+    if (debugMode) {
+      const debugErrorFile = path.join(logsDir, "debug-errors.jsonl");
+      await appendJsonlLine(debugErrorFile, {
+        ts: new Date().toISOString(),
+        exitCode: result.code,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      });
+    }
     throw new Error(result.stderr.trim() || result.stdout.trim() || `child pi exited with code ${result.code}`);
   }
 
@@ -437,6 +475,10 @@ export default function clawworldExtension(pi: ExtensionAPI) {
     return clawWorldConfig;
   }
 
+  function isDebugMode(): boolean {
+    return clawWorldConfig?.debug === true;
+  }
+
   // ── Status push ──────────────────────────────────────────────────
 
   async function pushLifecycleStatus(ctx: ExtensionContext, eventAction: string): Promise<void> {
@@ -457,6 +499,24 @@ export default function clawworldExtension(pi: ExtensionAPI) {
 
     await postStatus(config, payload);
   }
+
+  // ── Debug command ───────────────────────────────────────────────
+
+  pi.registerCommand("clawworld-debug", {
+    description: "Toggle ClawWorld debug mode (logs child pi results)",
+    handler: async (_args, ctx) => {
+      const config = await ensureConfig();
+      if (!config) {
+        ctx.ui.notify(`ClawWorld not configured (${CONFIG_FILE})`, "warning");
+        return;
+      }
+      const next = !config.debug;
+      config.debug = next;
+      clawWorldConfig = config;
+      await saveClawWorldConfig(config);
+      ctx.ui.notify(`ClawWorld debug mode: ${next ? "ON" : "OFF"}`, "info");
+    },
+  });
 
   // ── Activity push (fire-and-forget) ─────────────────────────────
 
@@ -481,8 +541,8 @@ export default function clawworldExtension(pi: ExtensionAPI) {
     try {
       const recentMessages = getRecentMessages(ctx, 8);
       const latestUserPrompt = [...recentMessages].reverse().find((message) => message.role === "user")?.content ?? "";
-      const summary = await summarizeActivity(ctx, runMessages);
       const logsDir = await resolveLogsDir(ctx);
+      const summary = await summarizeActivity(ctx, runMessages, isDebugMode(), logsDir, ctx);
       const outputFile = path.join(logsDir, "activity-summary.jsonl");
       const activityAt = new Date().toISOString();
       const sessionKeyHash = hashSessionKey(sessionKey);
