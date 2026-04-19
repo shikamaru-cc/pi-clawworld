@@ -479,9 +479,6 @@ export default function clawworldExtension(pi: ExtensionAPI) {
 
     inFlightActivitySessions.add(sessionKey);
     try {
-      // Small delay to let transcript settle
-      await new Promise((resolve) => setTimeout(resolve, 150));
-
       const recentMessages = getRecentMessages(ctx, 8);
       const latestUserPrompt = [...recentMessages].reverse().find((message) => message.role === "user")?.content ?? "";
       const summary = await summarizeActivity(ctx, runMessages);
