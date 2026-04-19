@@ -5,6 +5,8 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
+// ─── Types ──────────────────────────────────────────────────────────
+
 type ClawWorldConfig = {
   deviceToken: string;
   lobsterId: string;
@@ -36,10 +38,14 @@ type ActivityPayload = {
   summary: string;
 };
 
+// ─── Constants ──────────────────────────────────────────────────────
+
 const CONFIG_DIR = path.join(os.homedir(), ".clawworld");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const MIN_ACTIVITY_PUSH_INTERVAL_MS = 60_000;
 const NO_ACTIVITY = "NONE";
+
+// ─── Helpers ────────────────────────────────────────────────────────
 
 function truncate(value: string, max = 160): string {
   const normalized = value.replace(/\s+/g, " ").trim();
@@ -113,7 +119,7 @@ function extractMessagePreview(message: unknown, max = 140): string {
 }
 
 function getRecentMessages(ctx: ExtensionContext, limit = 8): Array<{ role: string; content: string }> {
-  const messages = ctx.sessionManager
+  return ctx.sessionManager
     .getBranch()
     .filter((entry) => entry.type === "message")
     .map((entry) => entry.message)
@@ -126,15 +132,27 @@ function getRecentMessages(ctx: ExtensionContext, limit = 8): Array<{ role: stri
       role: extractMessageRole(message),
       content: truncate(extractTextContent((message as { content?: unknown })?.content ?? ""), 800),
     }));
-
-  return messages;
 }
 
-function getRecentContext(ctx: ExtensionContext, limit = 4): string {
+function formatRecentContext(ctx: ExtensionContext, limit = 4): string {
   const contextLines = getRecentMessages(ctx, limit).map(
     (message, index) => `${index + 1}. ${message.role}: ${message.content || "<empty>"}`,
   );
   return contextLines.length > 0 ? contextLines.join("\n") : "<none>";
+}
+
+function extractRunMessages(
+  messages: unknown[],
+  limit = 8,
+): string {
+  const filtered = messages
+    .filter((message) => {
+      const role = extractMessageRole(message);
+      return role === "user" || role === "assistant";
+    })
+    .slice(-limit)
+    .map((message, index) => `${index + 1}. ${extractMessagePreview(message)}`);
+  return filtered.length > 0 ? filtered.join("\n") : "<none>";
 }
 
 function normalizePrompt(prompt: string): string {
@@ -145,14 +163,146 @@ function normalizePrompt(prompt: string): string {
     .trim();
 }
 
+function collectInstalledSkills(pi: ExtensionAPI): string[] | undefined {
+  const skills = pi
+    .getCommands()
+    .filter((command) => command.source === "skill")
+    .map((command) => {
+      if (command.name.startsWith("skill:")) {
+        return command.name.slice("skill:".length).trim();
+      }
+      const fromPath = path.basename(path.dirname(command.sourceInfo.path));
+      return fromPath.trim();
+    })
+    .filter(Boolean);
+
+  if (skills.length === 0) {
+    return undefined;
+  }
+
+  return [...new Set(skills)].sort();
+}
+
+function getUsageFromAssistantMessage(message: unknown): { input?: number; output?: number } | undefined {
+  if (!message || typeof message !== "object") {
+    return undefined;
+  }
+
+  const record = message as {
+    role?: unknown;
+    usage?: {
+      input?: number;
+      output?: number;
+    };
+  };
+
+  if (record.role !== "assistant" || !record.usage) {
+    return undefined;
+  }
+
+  if (record.usage.input == null && record.usage.output == null) {
+    return undefined;
+  }
+
+  return {
+    input: record.usage.input,
+    output: record.usage.output,
+  };
+}
+
+// ─── Config ─────────────────────────────────────────────────────────
+
+function normalizeConfig(parsed: Partial<ClawWorldConfig>): ClawWorldConfig | null {
+  if (
+    typeof parsed.deviceToken !== "string" ||
+    !parsed.deviceToken.trim() ||
+    typeof parsed.lobsterId !== "string" ||
+    !parsed.lobsterId.trim() ||
+    typeof parsed.instanceId !== "string" ||
+    !parsed.instanceId.trim() ||
+    typeof parsed.endpoint !== "string" ||
+    !parsed.endpoint.trim()
+  ) {
+    return null;
+  }
+
+  return {
+    deviceToken: parsed.deviceToken.trim(),
+    lobsterId: parsed.lobsterId.trim(),
+    instanceId: parsed.instanceId.trim(),
+    endpoint: parsed.endpoint.trim().replace(/\/+$/, ""),
+  };
+}
+
+async function loadClawWorldConfig(): Promise<ClawWorldConfig | null> {
+  try {
+    const raw = await fs.readFile(CONFIG_FILE, "utf8");
+    return normalizeConfig(JSON.parse(raw) as Partial<ClawWorldConfig>);
+  } catch {
+    return null;
+  }
+}
+
+// ─── API ────────────────────────────────────────────────────────────
+
+async function postStatus(config: ClawWorldConfig, payload: StatusPayload): Promise<void> {
+  const response = await fetch(`${config.endpoint}/api/claw/status`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.deviceToken}`,
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(5_000),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`status POST failed: ${response.status} ${text}`.trim());
+  }
+}
+
+async function postActivity(config: ClawWorldConfig, payload: ActivityPayload): Promise<void> {
+  const response = await fetch(`${config.endpoint}/api/claw/activity`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.deviceToken}`,
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(5_000),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`activity POST failed: ${response.status} ${text}`.trim());
+  }
+}
+
+// ─── Local logging ──────────────────────────────────────────────────
+
+async function appendJsonlLine(filePath: string, record: Record<string, unknown>): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.appendFile(filePath, `${JSON.stringify(record)}\n`, "utf8");
+}
+
+async function resolveLogsDir(ctx: ExtensionContext): Promise<string> {
+  const logsDir = path.join(ctx.cwd, ".pi", "extensions", "clawworld", "logs");
+  await fs.mkdir(logsDir, { recursive: true });
+  return logsDir;
+}
+
+// ─── Child pi summarizer ────────────────────────────────────────────
+
 async function runChildPi(prompt: string, signal?: AbortSignal): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return await new Promise((resolve, reject) => {
+    const args = ["-p", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files"];
     const child =
       process.platform === "win32"
-        ? spawn("cmd.exe", ["/d", "/s", "/c", "pi.cmd -p --no-extensions --no-skills --no-prompt-templates --no-context-files"], {
+        ? spawn("cmd.exe", ["/d", "/s", "/c", `pi.cmd ${args.join(" ")}`], {
             stdio: ["pipe", "pipe", "pipe"],
           })
-        : spawn("pi", ["-p", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files"], {
+        : spawn("pi", args, {
             stdio: ["pipe", "pipe", "pipe"],
           });
 
@@ -212,18 +362,16 @@ async function runChildPi(prompt: string, signal?: AbortSignal): Promise<{ code:
   });
 }
 
-async function summarizeActivityWithChildPi(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  prompt: string,
-): Promise<string> {
-  const normalizedPrompt = normalizePrompt(prompt);
+async function summarizeActivity(ctx: ExtensionContext, runMessages?: unknown[]): Promise<string> {
+  const recentMessages = getRecentMessages(ctx, 8);
+  const runTranscript = extractRunMessages(runMessages ?? []);
+  const latestUserMessage = [...recentMessages].reverse().find((message) => message.role === "user");
+  const normalizedPrompt = normalizePrompt(latestUserMessage?.content ?? "");
+
   if (!normalizedPrompt) {
     return NO_ACTIVITY;
   }
 
-  const recentMessages = getRecentMessages(ctx, 8);
-  const latestUserMessage = [...recentMessages].reverse().find((message) => message.role === "user");
   const recentTranscript = recentMessages.length
     ? recentMessages
         .map((message, index) => `${index + 1}. ${message.role}: ${message.content || "<empty>"}`)
@@ -233,19 +381,25 @@ async function summarizeActivityWithChildPi(
   const childPrompt = [
     "You are generating a short, safe activity summary for a coding session.",
     "Decide whether the LATEST_USER_MESSAGE indicates a real, concrete work topic.",
+    "Prefer CURRENT_RUN_MESSAGES as evidence of what was actually completed in this run.",
     "Requirements:",
     "- Output only plain text.",
     `- If there is no clear, concrete work topic, output exactly ${NO_ACTIVITY}.`,
     "- Output exactly NONE if the latest user message is a heartbeat, ping, pong, keepalive, health check, probe, connection test, or similar non-work message.",
     "- Output exactly NONE if the latest user message is too vague, transitional, meta-only, or cannot be understood confidently.",
     "- Do NOT infer the task from older context alone.",
-    "- RECENT_TRANSCRIPT is only supporting evidence; the latest user message must itself justify the activity.",
+    "- RECENT_TRANSCRIPT is supporting context only.",
+    "- If CURRENT_RUN_MESSAGES are substantive, prefer summarizing what was actually accomplished there.",
+    "- The latest user message must still be consistent with the summary.",
     "- Otherwise output exactly 1 short sentence, ideally under 140 characters.",
     "- Do not include secrets, credentials, or long quotes.",
     "- Do not explain your reasoning.",
     "",
     "LATEST_USER_MESSAGE:",
     latestUserMessage ? `${latestUserMessage.role}: ${latestUserMessage.content}` : "<missing>",
+    "",
+    "CURRENT_RUN_MESSAGES:",
+    runTranscript,
     "",
     "RECENT_TRANSCRIPT:",
     recentTranscript,
@@ -268,141 +422,7 @@ async function summarizeActivityWithChildPi(
   return truncate(output.split(/\r?\n/).find(Boolean) ?? output, 280);
 }
 
-function collectInstalledSkills(pi: ExtensionAPI): string[] | undefined {
-  const skills = pi
-    .getCommands()
-    .filter((command) => command.source === "skill")
-    .map((command) => {
-      if (command.name.startsWith("skill:")) {
-        return command.name.slice("skill:".length).trim();
-      }
-      const fromPath = path.basename(path.dirname(command.sourceInfo.path));
-      return fromPath.trim();
-    })
-    .filter(Boolean);
-
-  if (skills.length === 0) {
-    return undefined;
-  }
-
-  return [...new Set(skills)].sort();
-}
-
-function getUsageFromAssistantMessage(message: unknown): { input?: number; output?: number } | undefined {
-  if (!message || typeof message !== "object") {
-    return undefined;
-  }
-
-  const record = message as {
-    role?: unknown;
-    usage?: {
-      input?: number;
-      output?: number;
-    };
-  };
-
-  if (record.role !== "assistant" || !record.usage) {
-    return undefined;
-  }
-
-  if (record.usage.input == null && record.usage.output == null) {
-    return undefined;
-  }
-
-  return {
-    input: record.usage.input,
-    output: record.usage.output,
-  };
-}
-
-function normalizeConfig(parsed: Partial<ClawWorldConfig>): ClawWorldConfig | null {
-  if (
-    typeof parsed.deviceToken !== "string" ||
-    !parsed.deviceToken.trim() ||
-    typeof parsed.lobsterId !== "string" ||
-    !parsed.lobsterId.trim() ||
-    typeof parsed.instanceId !== "string" ||
-    !parsed.instanceId.trim() ||
-    typeof parsed.endpoint !== "string" ||
-    !parsed.endpoint.trim()
-  ) {
-    return null;
-  }
-
-  return {
-    deviceToken: parsed.deviceToken.trim(),
-    lobsterId: parsed.lobsterId.trim(),
-    instanceId: parsed.instanceId.trim(),
-    endpoint: parsed.endpoint.trim().replace(/\/+$/, ""),
-  };
-}
-
-async function loadClawWorldConfig(): Promise<ClawWorldConfig | null> {
-  try {
-    const raw = await fs.readFile(CONFIG_FILE, "utf8");
-    return normalizeConfig(JSON.parse(raw) as Partial<ClawWorldConfig>);
-  } catch {
-    return null;
-  }
-}
-
-async function saveClawWorldConfig(config: ClawWorldConfig): Promise<void> {
-  await fs.mkdir(CONFIG_DIR, { recursive: true });
-  await fs.writeFile(CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`, "utf8");
-}
-
-async function deleteClawWorldConfig(): Promise<void> {
-  await fs.rm(CONFIG_FILE, { force: true });
-}
-
-function createInstanceId(): string {
-  return crypto.createHash("sha256").update(os.hostname()).digest("hex").slice(0, 32);
-}
-
-async function postStatus(config: ClawWorldConfig, payload: StatusPayload): Promise<void> {
-  const response = await fetch(`${config.endpoint}/api/claw/status`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.deviceToken}`,
-    },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(5_000),
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`status POST failed: ${response.status} ${text}`.trim());
-  }
-}
-
-async function postActivity(config: ClawWorldConfig, payload: ActivityPayload): Promise<void> {
-  const response = await fetch(`${config.endpoint}/api/claw/activity`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.deviceToken}`,
-    },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(5_000),
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`activity POST failed: ${response.status} ${text}`.trim());
-  }
-}
-
-async function appendJsonlLine(filePath: string, record: Record<string, unknown>): Promise<void> {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.appendFile(filePath, `${JSON.stringify(record)}\n`, "utf8");
-}
-
-async function resolveLogsDir(ctx: ExtensionContext): Promise<string> {
-  const logsDir = path.join(ctx.cwd, ".pi", "extensions", "clawworld", "logs");
-  await fs.mkdir(logsDir, { recursive: true });
-  return logsDir;
-}
+// ─── Extension entry ────────────────────────────────────────────────
 
 export default function clawworldExtension(pi: ExtensionAPI) {
   let clawWorldConfig: ClawWorldConfig | null = null;
@@ -416,6 +436,8 @@ export default function clawworldExtension(pi: ExtensionAPI) {
     clawWorldConfig = await loadClawWorldConfig();
     return clawWorldConfig;
   }
+
+  // ── Status push ──────────────────────────────────────────────────
 
   async function pushLifecycleStatus(ctx: ExtensionContext, eventAction: string): Promise<void> {
     const sessionKey = resolveSessionKey(ctx);
@@ -436,7 +458,9 @@ export default function clawworldExtension(pi: ExtensionAPI) {
     await postStatus(config, payload);
   }
 
-  async function handleActivityPush(ctx: ExtensionContext, prompt: string): Promise<void> {
+  // ── Activity push (fire-and-forget) ─────────────────────────────
+
+  async function handleActivityPush(ctx: ExtensionContext, runMessages?: unknown[]): Promise<void> {
     const sessionKey = resolveSessionKey(ctx);
     const config = await ensureConfig();
     if (!config) {
@@ -455,12 +479,17 @@ export default function clawworldExtension(pi: ExtensionAPI) {
 
     inFlightActivitySessions.add(sessionKey);
     try {
-      const summary = await summarizeActivityWithChildPi(pi, ctx, prompt);
+      // Small delay to let transcript settle
+      await new Promise((resolve) => setTimeout(resolve, 150));
+
+      const recentMessages = getRecentMessages(ctx, 8);
+      const latestUserPrompt = [...recentMessages].reverse().find((message) => message.role === "user")?.content ?? "";
+      const summary = await summarizeActivity(ctx, runMessages);
       const logsDir = await resolveLogsDir(ctx);
       const outputFile = path.join(logsDir, "activity-summary.jsonl");
       const activityAt = new Date().toISOString();
       const sessionKeyHash = hashSessionKey(sessionKey);
-      const recentContext = getRecentContext(ctx);
+      const recentContext = formatRecentContext(ctx);
       const kind = "other";
 
       if (summary === NO_ACTIVITY) {
@@ -468,7 +497,7 @@ export default function clawworldExtension(pi: ExtensionAPI) {
           ts: activityAt,
           sessionKey,
           sessionKeyHash,
-          prompt: truncate(normalizePrompt(prompt), 240),
+          prompt: truncate(normalizePrompt(latestUserPrompt), 240),
           recentContext,
           summary,
           posted: false,
@@ -500,7 +529,7 @@ export default function clawworldExtension(pi: ExtensionAPI) {
         ts: activityAt,
         sessionKey,
         sessionKeyHash,
-        prompt: truncate(normalizePrompt(prompt), 240),
+        prompt: truncate(normalizePrompt(latestUserPrompt), 240),
         recentContext,
         summary,
         activityId,
@@ -511,136 +540,7 @@ export default function clawworldExtension(pi: ExtensionAPI) {
     }
   }
 
-  pi.registerCommand("clawworld-status", {
-    description: "Show whether the current pi session is connected to ClawWorld",
-    handler: async (_args, ctx) => {
-      const config = await ensureConfig();
-      if (!config) {
-        ctx.ui.notify(`ClawWorld not configured (${CONFIG_FILE})`, "warning");
-        return;
-      }
-      ctx.ui.notify(`ClawWorld bound: lobster=${config.lobsterId} instance=${config.instanceId}`, "info");
-    },
-  });
-
-  pi.registerCommand("clawworld-bind", {
-    description: "Bind this pi instance to ClawWorld (usage: /clawworld-bind [binding-code] [endpoint])",
-    handler: async (args, ctx) => {
-      const parts = args.trim().split(/\s+/).filter(Boolean);
-      let bindingCode = parts[0];
-      let endpoint = parts[1] ?? "https://api.claw-world.app";
-
-      if (!bindingCode && ctx.hasUI) {
-        bindingCode = await ctx.ui.input("ClawWorld binding code:", "6-character code") ?? "";
-      }
-
-      if (!bindingCode) {
-        ctx.ui.notify("Missing binding code", "warning");
-        return;
-      }
-
-      bindingCode = bindingCode.trim().toUpperCase();
-      endpoint = endpoint.trim().replace(/\/+$/, "");
-      const instanceId = createInstanceId();
-
-      try {
-        const response = await fetch(`${endpoint}/api/claw/bind/verify`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            binding_code: bindingCode,
-            instance_id: instanceId,
-          }),
-          signal: AbortSignal.timeout(10_000),
-        });
-
-        const body = (await response.json().catch(() => ({}))) as {
-          lobster_id?: unknown;
-          lobster_name?: unknown;
-          device_token?: unknown;
-          error?: unknown;
-        };
-
-        if (!response.ok) {
-          const message = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
-          throw new Error(message);
-        }
-
-        const config = normalizeConfig({
-          deviceToken: typeof body.device_token === "string" ? body.device_token : "",
-          lobsterId: typeof body.lobster_id === "string" ? body.lobster_id : "",
-          instanceId,
-          endpoint,
-        });
-
-        if (!config) {
-          throw new Error("bind response missing required fields");
-        }
-
-        await saveClawWorldConfig(config);
-        clawWorldConfig = config;
-
-        if (ctx.hasUI) {
-          ctx.ui.setStatus("clawworld", `🌍 ClawWorld ${config.lobsterId}`);
-        }
-
-        const lobsterName = typeof body.lobster_name === "string" && body.lobster_name.trim()
-          ? body.lobster_name.trim()
-          : config.lobsterId;
-        ctx.ui.notify(`🌍 Bound to ClawWorld: ${lobsterName}`, "info");
-      } catch (error) {
-        ctx.ui.notify(
-          `ClawWorld bind failed: ${error instanceof Error ? error.message : String(error)}`,
-          "error",
-        );
-      }
-    },
-  });
-
-  pi.registerCommand("clawworld-unbind", {
-    description: "Unbind this pi instance from ClawWorld",
-    handler: async (_args, ctx) => {
-      const config = await ensureConfig();
-      if (!config) {
-        ctx.ui.notify(`ClawWorld not configured (${CONFIG_FILE})`, "warning");
-        return;
-      }
-
-      try {
-        const response = await fetch(`${config.endpoint}/api/claw/unbind`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${config.deviceToken}`,
-          },
-          body: JSON.stringify({
-            instance_id: config.instanceId,
-          }),
-          signal: AbortSignal.timeout(10_000),
-        });
-
-        if (!response.ok) {
-          const body = (await response.json().catch(() => ({}))) as { error?: unknown };
-          const message = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
-          throw new Error(message);
-        }
-
-        await deleteClawWorldConfig();
-        clawWorldConfig = null;
-        if (ctx.hasUI) {
-          ctx.ui.setStatus("clawworld", "🌍 ClawWorld unbound");
-        }
-        ctx.ui.notify("Disconnected from ClawWorld.", "info");
-      } catch (error) {
-        ctx.ui.notify(
-          `ClawWorld unbind failed: ${error instanceof Error ? error.message : String(error)}`,
-          "error",
-        );
-      }
-    },
-  });
+  // ── Events ───────────────────────────────────────────────────────
 
   pi.on("session_start", async (event, ctx) => {
     const config = await ensureConfig();
@@ -706,13 +606,6 @@ export default function clawworldExtension(pi: ExtensionAPI) {
         "warning",
       );
     }
-
-    void handleActivityPush(ctx, event.prompt).catch((error) => {
-      ctx.ui.notify(
-        `ClawWorld activity upload failed: ${error instanceof Error ? error.message : String(error)}`,
-        "warning",
-      );
-    });
   });
 
   pi.on("message_end", async (event, ctx) => {
@@ -751,5 +644,14 @@ export default function clawworldExtension(pi: ExtensionAPI) {
         "warning",
       );
     }
+  });
+
+  pi.on("agent_end", async (event, ctx) => {
+    void handleActivityPush(ctx, event.messages).catch((error) => {
+      ctx.ui.notify(
+        `ClawWorld activity upload failed: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    });
   });
 }

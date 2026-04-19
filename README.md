@@ -1,71 +1,56 @@
 # ClawWorld pi Extension
 
-A local pi extension based on `skill/plugin/clawworld/` that reports pi session status and activity to ClawWorld.
+基于 `~/.clawworld/config.json` 的本地 pi extension，实现 pi 会话状态上报与 activity summary。
 
-## Locations
+## 位置
 
-- Entry: `.pi/extensions/clawworld/index.ts`
-- Logs: `.pi/extensions/clawworld/logs/activity-summary.jsonl`
-- Config: `~/.clawworld/config.json`
+- 入口：`.pi/extensions/clawworld/index.ts`
+- 日志：`.pi/extensions/clawworld/logs/activity-summary.jsonl`
+- 配置：`~/.clawworld/config.json`
 
-> This pi extension uses its own config directory at `~/.clawworld/`.
+## 当前行为
 
-## Current behavior
-
-### Status reporting
+### Status 上报
 
 - `session_start` → `SessionStart`
 - `before_agent_start` → `UserPromptSubmit`
-- `message_end` (assistant only) → `MessageEnd`
+- `message_end`（assistant only） → `MessageEnd`
 - `session_shutdown` → `SessionEnd`
 
-The `MessageEnd` event includes:
+`MessageEnd` 事件会附带：
 
 - `token_usage`
-- `installed_skills` (derived from currently loaded pi skill commands)
+- `installed_skills`（从当前 pi 已加载的 skill commands 推导）
 - `session_key_hash`
 - `instance_id`
 - `lobster_id`
 
-### Activity reporting
+### Activity Summary
 
-On `before_agent_start`:
+在 `agent_end` 时 fire-and-forget：
 
-- Reads recent conversation messages and uses a child `pi` process to generate an activity summary
-- The child `pi` receives the summary prompt via stdin to avoid long command line and escaping issues on Windows
-- Returns `NONE` for heartbeat / ping / keepalive / overly vague prompts
-- If the summary is `NONE`, it only writes a local log entry and does not call `/api/claw/activity`
-- Otherwise it calls `/api/claw/activity`
-- Applies a 60-second throttle per session
+- 读取最近对话消息，调用子 `pi -p` 进程生成 activity summary
+- 参考 `agent_end` 提供的当前轮 `event.messages`，贴近"这轮实际完成了什么"
+- 子 `pi` 通过 stdin 接收 summary prompt
+- 设置 `--no-session --no-extensions --no-skills --no-prompt-templates --no-context-files` 实现完全隔离
+- 对 heartbeat / ping / keepalive / 过于空泛的 prompt 返回 `NONE`
+- `NONE` 时只写本地日志，不调用 `/api/claw/activity`
+- 非 `NONE` 时调用 `/api/claw/activity`
+- 150ms 延迟等待 transcript 落盘
+- 按 session 做 60 秒节流
+- 使用 `void` fire-and-forget，不阻塞用户
 
-## Commands
+## 命令
 
-Available inside pi:
+当前 extension 不提供任何用户命令。
 
-```text
-/clawworld-status
-/clawworld-bind ABC123
-/clawworld-unbind
-```
+## 说明
 
-Details:
+这版是 **纯埋点型** extension：
 
-- `/clawworld-status`: check whether the extension has loaded a ClawWorld config
-- `/clawworld-bind [binding-code] [endpoint]`: calls `POST /api/claw/bind/verify` and writes config to `~/.clawworld/config.json`
-- `/clawworld-unbind`: calls `POST /api/claw/unbind` and removes the local config file
-
-## Notes
-
-This is a **pi extension PoC**, not a literal one-to-one port of the OpenClaw plugin:
-
-- Activity summary generation now uses a child `pi` process instead of a local heuristic
-- `installed_skills` comes from the pi runtime, not from workspace `skills/*/SKILL.md`
-- `session_key_hash` is derived from the pi session file path (or ephemeral cwd)
-- The config file location is `~/.clawworld/config.json`
-
-Possible future improvements:
-
-- Better summary generation strategy
-- Reporting invoked skills / tools
-- Finer-grained deduping and merging
-- More bind-time UX, such as profile links and richer success messages
+- 不负责 bind / unbind（由 skill 侧负责）
+- 不负责用户交互
+- 只做 status / usage / activity 的自动上报
+- `installed_skills` 来源于 pi runtime
+- `session_key_hash` 使用 pi session file 路径（或 ephemeral cwd）做哈希
+- 配置文件位置为 `~/.clawworld/config.json`
